@@ -13,6 +13,21 @@ import (
 	"strings"
 )
 
+// ToDo
+//
+//コミットしていないとき = 参照すべき以前のINDEXファイルがない
+// → すべてのファイルをcreateステータスで書き込む
+//
+//コミットしているとき = 参照すべき以前のINDEXファイルが有る
+// → 以前のINDEXファイルと比較し、INDEXファイルをすべて書き換える
+// このとき参照していた以前のINDEXの情報を書き込みたい
+//
+// MimAdd の中で旧INDEXの情報と、新INDEXの情報を管理する。
+// makeBlobでfilenameとhashを返し、filenameとhashを旧indexと比較して、ステータス情報を確定
+// それを新INDEX(slice)でappend
+// Addの最後にINDEXに書き込み
+
+//Init コマンド .mim配下のフォルダを作成する。
 func MimInit() {
 	inf := []string{".mim", ".mim/refs", ".mim/object"}
 
@@ -32,8 +47,13 @@ func MimInit() {
 	log.Printf("==== INIT Finish ====\n\n")
 }
 
+//Add コマンド
 func MimAdd() {
 	log.Println("==== Add Start ====")
+	initIndex()
+	indexMap := readIndex()
+
+	var newIndexData []byte
 
 	dir, err := os.Getwd()
 	if err != nil {
@@ -50,16 +70,24 @@ func MimAdd() {
 
 		if !d.IsDir() {
 			path, _ := filepath.Rel(dir, path)
-			status, path, hash := makeBlob(path)
-			writeIndex(status, path, hash)
+			hash := makeBlob(path)
+			status := getBlobStatus(indexMap, path, hash)
+			c := bytes.Join(
+				[][]byte{[]byte(status), []byte(" "), //status
+					[]byte(path), []byte(" "), //path
+					[]byte(fmt.Sprintf("%x\n", hash))}, //hash
+				[]byte(""))
+			newIndexData = append(newIndexData, c...)
 		}
 		return err
 	})
 
+	writeIndex(newIndexData)
 	log.Printf("==== Add Finish ====\n\n")
 }
 
-func makeBlob(filename string) (string, string, [28]byte) {
+//Blob を作る
+func makeBlob(filename string) (hash [28]byte) {
 	f, err := os.Open(filename)
 	if err != nil {
 		log.Fatal(err)
@@ -82,7 +110,7 @@ func makeBlob(filename string) (string, string, [28]byte) {
 	compressor.Close()
 
 	//sha224
-	hash := sha256.Sum224(blobContent)
+	hash = sha256.Sum224(blobContent)
 
 	//open write file
 	blobFile, err := os.Create(fmt.Sprintf(".mim/object/%x", hash))
@@ -100,70 +128,84 @@ func makeBlob(filename string) (string, string, [28]byte) {
 	}
 	writer.Flush()
 
-	status := "create"
-	path := filename
-	return status, path, hash
-
+	return hash
 }
 
-func writeIndex(status string, path string, hash [28]byte) {
-	//Write IndexFile
-	indexFile, err := os.OpenFile(".mim/index", os.O_WRONLY|os.O_APPEND|os.O_CREATE, os.ModePerm)
+//INDEXファイルを初期化する。INDEXファイルが存在しなければ作成、存在すればログを吐くだけ。
+func initIndex() {
+	indexFilename := ".mim/INDEX"
+	if f, err := os.Stat(indexFilename); os.IsNotExist(err) || f.IsDir() {
+		indexFile, err := os.OpenFile(indexFilename, os.O_CREATE, os.ModePerm)
+		if err != nil {
+			log.Fatal(err)
+		} else {
+			log.Fatal(err)
+			log.Println("INIT INDEX")
+		}
+		defer indexFile.Close()
+	} else {
+		log.Println("Has Been Exist Index")
+	}
+}
+
+//現在あるINDEXファイルを読み込み、mapで返す。
+func readIndex() (indexMap map[string]string) {
+	indexMap = make(map[string]string)
+	indexFilename := ".mim/INDEX"
+
+	indexFile, err := os.Open(indexFilename)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer indexFile.Close()
 
-	hash16x := fmt.Sprintf("%x\n", hash)
-	indexContent := bytes.Join([][]byte{[]byte(status), []byte(" "), []byte(path), []byte(" "), []byte(hash16x)}, []byte(""))
-
-	indexWrite := bufio.NewWriter(indexFile)
-	if _, err := indexWrite.Write(indexContent); err != nil {
-		log.Fatal(err)
-	} else {
-		log.Printf("Add INDEX: %s : %s\n", path, status)
-	}
-	indexWrite.Flush()
-}
-
-func MimCommit() {
-
-}
-
-func test(filename string, hash string) (status string) {
-
-	var indexData [][]string
-
-	f, err := os.Open(".mim/Index")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(indexFile)
 	for scanner.Scan() {
 		fileContent := scanner.Text()
-		dataArr := strings.Split(fileContent, " ")
-		indexData = append(indexData, dataArr)
-	}
-	for i := 0; i < len(indexData); i++ {
-		fmt.Println(indexData[i][1])
-		if filename == indexData[i][1] {
-			if hash == indexData[i][2] {
-				status = "noChange"
-			} else {
-				status = "Change"
-			}
-		} else {
-			status = "create"
+		if fileContent != "" {
+			dataArr := strings.Split(fileContent, " ")
+			// status path hashで構成されているはず。statusを消すなら要変更
+			indexMap[dataArr[1]] = dataArr[2]
 		}
 	}
 	return
 }
 
+//INDEXファイルを上書きする。
+func writeIndex(indexData []byte) {
+	indexFilename := ".mim/INDEX"
+	indexFile, err := os.OpenFile(indexFilename, os.O_CREATE|os.O_WRONLY, os.ModePerm)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer indexFile.Close()
+
+	writer := bufio.NewWriter(indexFile)
+	if _, err := writer.Write(indexData); err != nil {
+		log.Fatal(err)
+	} else {
+		log.Printf("Make INDEX")
+	}
+	writer.Flush()
+}
+
+//indexのfilenameとhashを比較して、更新されているのかどうかを返す
+func getBlobStatus(indexMap map[string]string, filename string, hash [28]byte) (status string) {
+
+	if h, ok := indexMap[filename]; ok {
+		if h == fmt.Sprintf("%x", hash) {
+			status = "notChange"
+		} else {
+			status = "Change"
+		}
+	} else {
+		status = "Create"
+	}
+
+	return
+}
+
 func main() {
-	status := test("testfile.txt", "186326af9ecd40de5cb11b6655c00ffb5696677335e0bd23cc888c4b")
-	fmt.Println(status)
-	// MimInit()
-	// MimAdd()
+	MimInit()
+	MimAdd()
 }
